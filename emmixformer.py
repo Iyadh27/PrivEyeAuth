@@ -48,9 +48,13 @@ class PreprocessingBlock(nn.Module):
         dx = coords[:, :, 1:] - coords[:, :, :-1]  # (B, 2, T-1)
         v = torch.zeros_like(coords)
         v[:, :, 1:] = dx
+        # Ensure no NaN/Inf in velocity tensor
+        v = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Velocity magnitude (assuming coordinates already in deg or appropriately scaled)
+        # Clamp any NaN or Inf values to prevent training instability
         vel_mag = torch.sqrt(v[:, 0] ** 2 + v[:, 1] ** 2 + self.eps)  # (B, T)
+        vel_mag = torch.nan_to_num(vel_mag, nan=0.0, posinf=0.0, neginf=0.0)  # (B, T)
 
         # Create slow / fast masks; keep dimensions broadcastable to (B, 2, T)
         slow_mask = (vel_mag < self.velocity_threshold).unsqueeze(1)  # (B, 1, T)
@@ -352,24 +356,23 @@ class FourierTransformer(nn.Module):
         # x: (B, T, C)
         B, T, C = x.shape
 
-        # FFT along time dimension
-        X_f = torch.fft.rfft(x, dim=1)  # (B, F, C), F = T//2+1
-
+        # FFT along time dimension (dim=1) with orthonormal normalization
+        X_f = torch.fft.rfft(x, dim=1, norm='ortho')  # (B, F, C), F = T//2+1
+        
+        # Extract amplitude and phase
         amplitude = torch.abs(X_f)  # (B, F, C)
         phase = torch.angle(X_f)  # (B, F, C)
 
-        # Process amplitude and phase as sequences over frequency
-        amp_in = amplitude  # (B, F, C)
-        phase_in = phase  # (B, F, C)
+        # Process amplitude and phase as sequences over frequency dimension
+        # The frequency dimension (F) becomes the sequence dimension for transformers
+        amp_out = self.amp_transformer(amplitude)  # (B, F, C)
+        phase_out = self.phase_transformer(phase)  # (B, F, C)
 
-        amp_out = self.amp_transformer(amp_in)  # (B, F, C)
-        phase_out = self.phase_transformer(phase_in)  # (B, F, C)
+        # Recombine using torch.polar to reconstruct complex tensor
+        complex_spec = torch.polar(amp_out, phase_out)  # (B, F, C)
 
-        # Recombine
-        complex_spec = amp_out * torch.exp(1j * phase_out)  # (B, F, C)
-
-        # Inverse FFT back to time domain
-        x_time = torch.fft.irfft(complex_spec, n=T, dim=1)  # (B, T, C)
+        # Inverse FFT back to time domain with orthonormal normalization
+        x_time = torch.fft.irfft(complex_spec, n=T, dim=1, norm='ortho')  # (B, T, C)
         return x_time
 
 

@@ -1,6 +1,7 @@
 import argparse
 import glob
 import os
+import re
 from typing import List, Tuple, Dict
 
 import numpy as np
@@ -8,8 +9,37 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader, random_split
+from sklearn.metrics import roc_curve
+from scipy.optimize import brentq
+from scipy.interpolate import interp1d
 
 from emmixformer import EmMixformer
+
+
+def compute_eer(labels: np.ndarray, scores: np.ndarray) -> float:
+    """
+    Compute Equal Error Rate (EER) for biometric verification.
+    
+    Args:
+        labels: True labels (0 for genuine, 1 for impostor)
+        scores: Similarity scores (higher = more similar)
+    
+    Returns:
+        EER value (between 0 and 1)
+    """
+    # Compute ROC curve
+    fpr, tpr, thresholds = roc_curve(labels, scores)
+    
+    # EER is where FPR = 1 - TPR (FNR)
+    fnr = 1 - tpr
+    
+    # Find threshold where FPR = FNR
+    eer_threshold = thresholds[np.nanargmin(np.absolute(fnr - fpr))]
+    
+    # EER value
+    eer = fpr[np.nanargmin(np.absolute(fnr - fpr))]
+    
+    return float(eer)
 
 
 class CTBUEyeMovementDataset(Dataset):
@@ -44,14 +74,45 @@ class CTBUEyeMovementDataset(Dataset):
             raise RuntimeError(f"No .xlsx files found in {data_dir}")
 
         # Build subject-id to label mapping from filenames
+        # Robust extraction: try multiple patterns
         subject_ids: List[str] = []
         self.file_subject: List[str] = []
+        
         for f in self.files:
             base = os.path.basename(f)
-            subj = base[:3]  # '001-D-1.xlsx' -> '001'
+            # Try multiple extraction strategies
+            subj = None
+            
+            # Strategy 1: Split by underscore and take first part
+            if '_' in base:
+                parts = base.split('_')
+                if parts[0]:
+                    subj = parts[0]
+            
+            # Strategy 2: Split by hyphen and take first part
+            if subj is None and '-' in base:
+                parts = base.split('-')
+                if parts[0]:
+                    subj = parts[0]
+            
+            # Strategy 3: Extract first numeric sequence
+            if subj is None:
+                match = re.search(r'\d+', base)
+                if match:
+                    subj = match.group(0)
+            
+            # Strategy 4: Fallback to first 3 characters
+            if subj is None:
+                subj = base[:3]
+            
             subject_ids.append(subj)
             self.file_subject.append(subj)
-
+        
+        # Print first 3 examples for verification
+        print("Dataset initialization - First 3 files and extracted IDs:")
+        for i in range(min(3, len(self.files))):
+            print(f"  File: {os.path.basename(self.files[i])} -> Subject ID: {self.file_subject[i]}")
+        
         unique_ids = sorted(set(subject_ids))
         self.subj_to_label: Dict[str, int] = {sid: i for i, sid in enumerate(unique_ids)}
 
@@ -65,11 +126,18 @@ class CTBUEyeMovementDataset(Dataset):
 
         df = pd.read_excel(path)
 
+        # Drop rows with NaN in gaze coordinates if the expected columns exist
+        subset_cols = [c for c in [self.x_col, self.y_col] if c in df.columns]
+        if subset_cols:
+            df = df.dropna(subset=subset_cols)
+
         # Try lowercase then uppercase column names if needed
         if self.x_col not in df.columns or self.y_col not in df.columns:
             alt_x = self.x_col.upper()
             alt_y = self.y_col.upper()
             if alt_x in df.columns and alt_y in df.columns:
+                # Drop rows with NaN in gaze coordinates
+                df = df.dropna(subset=[alt_x, alt_y])
                 x_vals = df[alt_x].to_numpy(dtype=np.float32)
                 y_vals = df[alt_y].to_numpy(dtype=np.float32)
             else:
@@ -81,7 +149,12 @@ class CTBUEyeMovementDataset(Dataset):
             x_vals = df[self.x_col].to_numpy(dtype=np.float32)
             y_vals = df[self.y_col].to_numpy(dtype=np.float32)
 
-        seq = np.stack([x_vals, y_vals], axis=-1)  # (T, 2)
+        # Handle empty dataframe or very short sequences after dropping NaNs
+        if len(x_vals) == 0 or len(y_vals) == 0:
+            # Return zero sequence if dataframe is empty
+            seq = np.zeros((self.min_len, 2), dtype=np.float32)
+        else:
+            seq = np.stack([x_vals, y_vals], axis=-1)  # (T, 2)
 
         # Filter very short sequences
         if seq.shape[0] < self.min_len:
@@ -163,13 +236,17 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     split_name: str = "val",
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
     model.eval()
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
 
     criterion = nn.CrossEntropyLoss()
+    
+    # For EER computation: collect all genuine and impostor scores
+    all_probs = []
+    all_labels = []
 
     with torch.no_grad():
         for x, y in loader:
@@ -178,16 +255,59 @@ def evaluate(
 
             logits = model(x)
             loss = criterion(logits, y)
+            
+            # Get probabilities via softmax
+            probs = torch.softmax(logits, dim=1)  # (B, num_classes)
 
             total_loss += loss.item() * x.size(0)
             preds = logits.argmax(dim=1)
             total_correct += (preds == y).sum().item()
             total_samples += x.size(0)
+            
+            # Store probabilities and labels for EER
+            all_probs.append(probs.cpu().numpy())
+            all_labels.append(y.cpu().numpy())
 
     avg_loss = total_loss / total_samples
     accuracy = total_correct / total_samples
-    print(f"{split_name} loss={avg_loss:.4f}, acc={accuracy:.4f}")
-    return avg_loss, accuracy
+    
+    # Compute EER
+    all_probs = np.concatenate(all_probs, axis=0)  # (N, num_classes)
+    all_labels = np.concatenate(all_labels, axis=0)  # (N,)
+    
+    # For each sample:
+    # - Genuine score = probability assigned to correct class
+    # - Impostor score = max probability assigned to any other class
+    genuine_scores = []
+    impostor_scores = []
+    
+    for i in range(len(all_labels)):
+        true_label = all_labels[i]
+        prob_vec = all_probs[i]
+        
+        # Genuine score: probability of correct class
+        genuine_scores.append(prob_vec[true_label])
+        
+        # Impostor score: max probability of any incorrect class
+        mask = np.arange(len(prob_vec)) != true_label
+        if mask.sum() > 0:
+            impostor_scores.append(prob_vec[mask].max())
+    
+    # Create binary labels: 0 for genuine, 1 for impostor
+    scores = np.concatenate([genuine_scores, impostor_scores]) if (genuine_scores or impostor_scores) else np.array([])
+    labels = np.concatenate(
+        [np.zeros(len(genuine_scores)), np.ones(len(impostor_scores))]
+    ) if (genuine_scores or impostor_scores) else np.array([])
+    
+    # Compute EER with safety checks
+    if scores.size == 0 or np.isnan(scores).any():
+        print(f"Warning: EER scores are empty or contain NaNs for split '{split_name}'. Setting EER=0.5.")
+        eer = 0.5
+    else:
+        eer = compute_eer(labels, scores)
+    
+    print(f"{split_name} loss={avg_loss:.4f}, acc={accuracy:.4f}, EER={eer:.4f}")
+    return avg_loss, accuracy, eer
 
 
 def parse_args() -> argparse.Namespace:
@@ -200,7 +320,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--val-split", type=float, default=0.2)
@@ -285,7 +405,7 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         train_one_epoch(model, train_loader, optimizer, device, epoch)
-        _, val_acc = evaluate(model, val_loader, device, split_name="val")
+        _, val_acc, val_eer = evaluate(model, val_loader, device, split_name="val")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -294,10 +414,11 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "epoch": epoch,
                 "val_acc": val_acc,
+                "val_eer": val_eer,
                 "args": vars(args),
             }
             torch.save(best_state, args.save_path)
-            print(f"Saved new best model with val acc={val_acc:.4f} to {args.save_path}")
+            print(f"Saved new best model with val acc={val_acc:.4f}, val EER={val_eer:.4f} to {args.save_path}")
 
     # Load best model and evaluate on test set
     if best_state is not None:
