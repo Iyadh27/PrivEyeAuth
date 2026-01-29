@@ -9,18 +9,11 @@ from torch.nn import functional as F
 class PreprocessingBlock(nn.Module):
     """
     Preprocess raw eye-movement sequences into slow/fast streams.
-
-    Expected input shapes (x):
-      - (batch, time, 2)  -> will be transposed internally to (batch, 2, time)
-      - (batch, 2, time)
-
-    The block:
-      - computes velocity magnitude between consecutive samples
-      - thresholds velocity (default 40 deg/s) into:
-          slow  : likely fixations / smooth pursuit
-          fast  : likely saccades
-      - returns tensors shaped for Conv1d: (batch, 2, time)
-        with masking (zeros) applied per stream.
+    
+    According to the EmMixformer paper (Section III-B), the preprocessing splits
+    eye movement data based on velocity threshold (default 40°/s):
+    - Slow data: velocities < 40°/s (fixations/smooth pursuit)
+    - Fast data: velocities >= 40°/s (saccades)
     """
 
     def __init__(self, velocity_threshold: float = 40.0, eps: float = 1e-6):
@@ -43,18 +36,19 @@ class PreprocessingBlock(nn.Module):
                 f"in either dim 1 or 2, got shape {x.shape}"
             )
 
-        # Approximate velocity as first difference along time
-        # v[:, :, 0] == 0 to keep same temporal length
+        # Compute velocity as first difference
         dx = coords[:, :, 1:] - coords[:, :, :-1]  # (B, 2, T-1)
         v = torch.zeros_like(coords)
         v[:, :, 1:] = dx
+        v = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Velocity magnitude (assuming coordinates already in deg or appropriately scaled)
+        # Velocity magnitude
         vel_mag = torch.sqrt(v[:, 0] ** 2 + v[:, 1] ** 2 + self.eps)  # (B, T)
+        vel_mag = torch.nan_to_num(vel_mag, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Create slow / fast masks; keep dimensions broadcastable to (B, 2, T)
+        # Split into slow/fast streams
         slow_mask = (vel_mag < self.velocity_threshold).unsqueeze(1)  # (B, 1, T)
-        fast_mask = ~slow_mask  # (B, 1, T)
+        fast_mask = ~slow_mask
 
         slow_stream = coords * slow_mask  # (B, 2, T)
         fast_stream = coords * fast_mask  # (B, 2, T)
@@ -64,8 +58,8 @@ class PreprocessingBlock(nn.Module):
 
 class ConvBlock1D(nn.Module):
     """
-    Basic 1D convolutional block:
-      Conv1d -> BatchNorm1d -> ReLU -> AvgPool1d
+    Basic 1D convolutional block with proper initialization:
+    Conv1d -> BatchNorm1d -> ReLU -> AvgPool1d
     """
 
     def __init__(
@@ -76,7 +70,7 @@ class ConvBlock1D(nn.Module):
         pool_kernel_size: int = 2,
     ):
         super().__init__()
-        padding = kernel_size // 2  # keep temporal length before pooling
+        padding = kernel_size // 2
         self.conv = nn.Conv1d(
             in_channels,
             out_channels,
@@ -86,6 +80,11 @@ class ConvBlock1D(nn.Module):
         self.bn = nn.BatchNorm1d(out_channels)
         self.relu = nn.ReLU(inplace=True)
         self.pool = nn.AvgPool1d(kernel_size=pool_kernel_size, stride=pool_kernel_size)
+        
+        # Initialize weights
+        nn.init.kaiming_normal_(self.conv.weight, mode='fan_out', nonlinearity='relu')
+        if self.conv.bias is not None:
+            nn.init.constant_(self.conv.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv(x)
@@ -97,19 +96,8 @@ class ConvBlock1D(nn.Module):
 
 class SiameseCNN(nn.Module):
     """
-    Siamese CNN with two identical branches processing:
-      - slow stream
-      - fast stream
-
-    Each branch:
-      4x [Conv1d -> BN -> ReLU -> AvgPool1d],
-      with increasing kernel sizes to expand receptive field.
-
-    Input shapes:
-      slow, fast: (B, 2, T)
-
-    Output:
-      concatenated feature map: (B, 2 * out_channels_last_block, T_out)
+    Siamese CNN as described in EmMixformer paper (Section II-A).
+    Two identical branches process slow and fast streams with 4 convolutional blocks.
     """
 
     def __init__(
@@ -137,12 +125,6 @@ class SiameseCNN(nn.Module):
         self.out_channels = channels[-1]
 
     def forward(self, slow: torch.Tensor, fast: torch.Tensor) -> torch.Tensor:
-        if slow.shape != fast.shape:
-            raise ValueError(
-                f"SiameseCNN expects slow/fast tensors of same shape, "
-                f"got {slow.shape} and {fast.shape}"
-            )
-
         slow_feat = self.branch(slow)
         fast_feat = self.branch(fast)
 
@@ -167,7 +149,10 @@ class PositionalEncoding(nn.Module):
             * (-math.log(10000.0) / d_model)
         )
         pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
+        if d_model % 2 == 1:
+            pe[:, 1::2] = torch.cos(position * div_term[:-1])
+        else:
+            pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(1)  # (max_len, 1, d_model)
         self.register_buffer("pe", pe)
 
@@ -183,12 +168,8 @@ class PositionalEncoding(nn.Module):
 
 class AttentiveLSTMCell(nn.Module):
     """
-    Custom LSTM cell with a simple attention mechanism and peephole connections.
-
-    At each time step:
-      - computes a scalar attention weight between x_t and h_{t-1}
-      - forms a context vector as a mixture of x_t and h_{t-1}
-      - uses peephole connections (c_{t-1} into gates)
+    Attention LSTM cell as described in EmMixformer paper (Section II-B-b).
+    Incorporates attention mechanism into LSTM with peephole connections.
     """
 
     def __init__(self, input_size: int, hidden_size: int):
@@ -196,90 +177,108 @@ class AttentiveLSTMCell(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
 
-        # Parameters for attention over (x_t, h_{t-1})
+        # Attention parameters
         self.W_q = nn.Linear(input_size, hidden_size, bias=False)
         self.W_k = nn.Linear(hidden_size, hidden_size, bias=False)
         self.W_v = nn.Linear(hidden_size, hidden_size, bias=False)
         self.attn_proj = nn.Linear(input_size + hidden_size, input_size, bias=False)
 
-        # LSTM gates with peephole connections
+        # LSTM gates
         self.W_x = nn.Linear(input_size, 4 * hidden_size, bias=True)
         self.W_h = nn.Linear(hidden_size, 4 * hidden_size, bias=False)
 
+        # Peephole connections
         self.w_ci = nn.Parameter(torch.zeros(hidden_size))
         self.w_cf = nn.Parameter(torch.zeros(hidden_size))
         self.w_co = nn.Parameter(torch.zeros(hidden_size))
+        
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        for name, param in self.named_parameters():
+            if 'weight' in name:
+                nn.init.xavier_uniform_(param)
+            elif 'bias' in name:
+                nn.init.constant_(param, 0)
 
     def forward(
         self, x_t: torch.Tensor, h_prev: torch.Tensor, c_prev: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # x_t: (B, input_size), h_prev, c_prev: (B, hidden_size)
+        # Attention mechanism
+        q = self.W_q(x_t)
+        k = self.W_k(h_prev)
+        v = self.W_v(h_prev)
 
-        # Attention between x_t and h_prev
-        q = self.W_q(x_t)  # (B, H)
-        k = self.W_k(h_prev)  # (B, H)
-        v = self.W_v(h_prev)  # (B, H)
-
-        # Scaled dot-product attention, single score per batch element
         attn_scores = (q * k).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
-        alpha = torch.sigmoid(attn_scores)  # (B, 1), in (0,1)
+        alpha = torch.sigmoid(attn_scores)
 
-        context = alpha * v + (1.0 - alpha) * x_t  # broadcast over feature dim
+        context = alpha * v + (1.0 - alpha) * x_t
 
-        # Optionally project concatenation for richer interaction
-        mixed = torch.cat([context, h_prev], dim=-1)  # (B, input+H)
-        x_tilde = self.attn_proj(mixed)  # (B, input_size)
+        mixed = torch.cat([context, h_prev], dim=-1)
+        x_tilde = self.attn_proj(mixed)
 
-        # LSTM with peephole connections
-        gates = self.W_x(x_tilde) + self.W_h(h_prev)  # (B, 4H)
-        i, f, g, o = gates.chunk(4, dim=-1)
+        # LSTM gates with peephole connections
+        gates_x = self.W_x(x_tilde)
+        gates_h = self.W_h(h_prev)
+        
+        i_x, f_x, o_x, g_x = gates_x.chunk(4, dim=-1)
+        i_h, f_h, o_h, g_h = gates_h.chunk(4, dim=-1)
 
-        i = torch.sigmoid(i + self.w_ci * c_prev)
-        f = torch.sigmoid(f + self.w_cf * c_prev)
-        g = torch.tanh(g)
-        c_t = f * c_prev + i * g
-        o = torch.sigmoid(o + self.w_co * c_t)
-        h_t = o * torch.tanh(c_t)
+        i = torch.sigmoid(i_x + i_h + self.w_ci * c_prev)
+        f = torch.sigmoid(f_x + f_h + self.w_cf * c_prev)
+        g = torch.tanh(g_x + g_h)
+        
+        c = f * c_prev + i * g
+        o = torch.sigmoid(o_x + o_h + self.w_co * c)
+        h = o * torch.tanh(c)
 
-        return h_t, c_t
+        return h, c
 
 
 class AttentionLSTM(nn.Module):
     """
-    Sequence wrapper around AttentiveLSTMCell.
-
-    Input:
-      x: (B, T, input_size)
-
-    Output:
-      h_seq: (B, T, hidden_size)
+    Multi-layer Attention LSTM as described in the paper.
     """
 
-    def __init__(self, input_size: int, hidden_size: int):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1):
         super().__init__()
-        self.cell = AttentiveLSTMCell(input_size, hidden_size)
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
+        self.cells = nn.ModuleList([
+            AttentiveLSTMCell(input_size if i == 0 else hidden_size, hidden_size)
+            for i in range(num_layers)
+        ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, D = x.shape
-        h = x.new_zeros(B, self.cell.hidden_size)
-        c = x.new_zeros(B, self.cell.hidden_size)
+        # x: (B, T, input_size)
+        batch_size, seq_len, _ = x.shape
+        device = x.device
 
         outputs = []
-        for t in range(T):
-            h, c = self.cell(x[:, t, :], h, c)
-            outputs.append(h.unsqueeze(1))
-
-        return torch.cat(outputs, dim=1)  # (B, T, H)
+        for layer_idx, cell in enumerate(self.cells):
+            h = torch.zeros(batch_size, self.hidden_size, device=device)
+            c = torch.zeros(batch_size, self.hidden_size, device=device)
+            
+            layer_outputs = []
+            for t in range(seq_len):
+                if layer_idx == 0:
+                    x_t = x[:, t, :]
+                else:
+                    x_t = outputs[-1][:, t, :]
+                h, c = cell(x_t, h, c)
+                layer_outputs.append(h.unsqueeze(1))
+            
+            outputs.append(torch.cat(layer_outputs, dim=1))
+        
+        return outputs[-1]  # (B, T, hidden_size)
 
 
 class StandardTransformerEncoder(nn.Module):
     """
-    Wrapper around nn.TransformerEncoder with positional encoding.
-
-    Input:
-      x: (B, T, d_model)
-    Output:
-      x_enc: (B, T, d_model)
+    Standard Transformer encoder as described in EmMixformer paper (Section II-B-a).
     """
 
     def __init__(
@@ -296,7 +295,7 @@ class StandardTransformerEncoder(nn.Module):
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            batch_first=False,  # we'll transform to (T, B, C)
+            batch_first=False,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.pos_encoder = PositionalEncoding(d_model, dropout=dropout)
@@ -312,16 +311,8 @@ class StandardTransformerEncoder(nn.Module):
 
 class FourierTransformer(nn.Module):
     """
-    Fourier Transformer module:
-      - applies 1D FFT along the temporal dimension
-      - splits complex spectrum into amplitude & phase
-      - processes each with its own Transformer encoder
-      - recombines them and applies inverse FFT to return to time domain
-
-    Input:
-      x: (B, T, d_model)
-    Output:
-      x_time: (B, T, d_model)
+    Fourier Transformer as described in EmMixformer paper (Section II-B-c).
+    Performs self-attention in the frequency domain for global feature learning.
     """
 
     def __init__(
@@ -353,39 +344,28 @@ class FourierTransformer(nn.Module):
         B, T, C = x.shape
 
         # FFT along time dimension
-        X_f = torch.fft.rfft(x, dim=1)  # (B, F, C), F = T//2+1
-
+        X_f = torch.fft.rfft(x, dim=1, norm='ortho')  # (B, F, C)
+        
+        # Extract amplitude and phase
         amplitude = torch.abs(X_f)  # (B, F, C)
         phase = torch.angle(X_f)  # (B, F, C)
 
-        # Process amplitude and phase as sequences over frequency
-        amp_in = amplitude  # (B, F, C)
-        phase_in = phase  # (B, F, C)
-
-        amp_out = self.amp_transformer(amp_in)  # (B, F, C)
-        phase_out = self.phase_transformer(phase_in)  # (B, F, C)
+        # Process with transformers
+        amp_out = self.amp_transformer(amplitude)  # (B, F, C)
+        phase_out = self.phase_transformer(phase)  # (B, F, C)
 
         # Recombine
-        complex_spec = amp_out * torch.exp(1j * phase_out)  # (B, F, C)
+        complex_spec = torch.polar(amp_out, phase_out)  # (B, F, C)
 
-        # Inverse FFT back to time domain
-        x_time = torch.fft.irfft(complex_spec, n=T, dim=1)  # (B, T, C)
+        # Inverse FFT
+        x_time = torch.fft.irfft(complex_spec, n=T, dim=1, norm='ortho')  # (B, T, C)
         return x_time
 
 
 class MixBlock(nn.Module):
     """
-    Mixed block integrating:
-      - Attention LSTM (short-term dependencies)
-      - Standard Transformer (long-range dependencies)
-      - Fourier Transformer (frequency-domain global features)
-
-    Input:
-      x: (B, C_in, T)
-
-    Output:
-      concatenated features: (B, C_out, T)
-        where C_out = att_hidden_dim + trans_dim + fourier_dim
+    Mix Block as described in EmMixformer paper (Section II-B).
+    Combines Attention LSTM, Transformer, and Fourier Transformer.
     """
 
     def __init__(
@@ -401,12 +381,12 @@ class MixBlock(nn.Module):
     ):
         super().__init__()
 
-        # Project input channels to each module's working dimension
+        # Project input to each module's dimension
         self.proj_att = nn.Linear(in_channels, att_hidden_dim)
         self.proj_trans = nn.Linear(in_channels, trans_dim)
         self.proj_fourier = nn.Linear(in_channels, fourier_dim)
 
-        self.att_lstm = AttentionLSTM(att_hidden_dim, att_hidden_dim)
+        self.att_lstm = AttentionLSTM(att_hidden_dim, att_hidden_dim, num_layers=1)
         self.transformer = StandardTransformerEncoder(
             d_model=trans_dim,
             nhead=nhead,
@@ -423,25 +403,28 @@ class MixBlock(nn.Module):
         )
 
         self.out_channels = att_hidden_dim + trans_dim + fourier_dim
+        
+        # Initialize projections
+        for m in [self.proj_att, self.proj_trans, self.proj_fourier]:
+            nn.init.xavier_uniform_(m.weight)
+            nn.init.constant_(m.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C_in, T)
         B, C, T = x.shape
         x_t = x.transpose(1, 2)  # (B, T, C)
 
-        # Attention LSTM branch
+        # Three parallel branches
         att_in = self.proj_att(x_t)  # (B, T, att_hidden_dim)
         att_out = self.att_lstm(att_in)  # (B, T, att_hidden_dim)
 
-        # Standard Transformer branch
         trans_in = self.proj_trans(x_t)  # (B, T, trans_dim)
         trans_out = self.transformer(trans_in)  # (B, T, trans_dim)
 
-        # Fourier Transformer branch
         fourier_in = self.proj_fourier(x_t)  # (B, T, fourier_dim)
         fourier_out = self.fourier_transformer(fourier_in)  # (B, T, fourier_dim)
 
-        # Concatenate along feature dimension
+        # Concatenate features
         mixed = torch.cat([att_out, trans_out, fourier_out], dim=-1)  # (B, T, C_out)
         mixed = mixed.transpose(1, 2)  # (B, C_out, T)
         return mixed
@@ -449,8 +432,8 @@ class MixBlock(nn.Module):
 
 class EmMixformer(nn.Module):
     """
-    Full EmMixformer model:
-      PreprocessingBlock -> SiameseCNN -> MixBlock -> ClassifierHead
+    Full EmMixformer model as described in the paper.
+    Architecture: PreprocessingBlock -> SiameseCNN -> MixBlock(s) -> Classifier
     """
 
     def __init__(
@@ -465,6 +448,7 @@ class EmMixformer(nn.Module):
         transformer_layers: int = 2,
         transformer_ff_dim: int = 256,
         dropout: float = 0.1,
+        num_mix_blocks: int = 2,  # Paper uses 2 mix blocks
     ):
         super().__init__()
 
@@ -474,50 +458,77 @@ class EmMixformer(nn.Module):
             base_channels=cnn_base_channels,
         )
 
+        # First mix block
         mix_in_channels = self.siamese_cnn.out_channels * 2
+        
+        # Create mix blocks (paper mentions stacking 2 layers)
+        self.mix_blocks = nn.ModuleList()
+        for i in range(num_mix_blocks):
+            in_ch = mix_in_channels if i == 0 else (mix_att_hidden_dim + mix_trans_dim + mix_fourier_dim)
+            self.mix_blocks.append(
+                MixBlock(
+                    in_channels=in_ch,
+                    att_hidden_dim=mix_att_hidden_dim,
+                    trans_dim=mix_trans_dim,
+                    fourier_dim=mix_fourier_dim,
+                    nhead=transformer_heads,
+                    num_layers=transformer_layers,
+                    dim_feedforward=transformer_ff_dim,
+                    dropout=dropout,
+                )
+            )
 
-        self.mix_block = MixBlock(
-            in_channels=mix_in_channels,
-            att_hidden_dim=mix_att_hidden_dim,
-            trans_dim=mix_trans_dim,
-            fourier_dim=mix_fourier_dim,
-            nhead=transformer_heads,
-            num_layers=transformer_layers,
-            dim_feedforward=transformer_ff_dim,
-            dropout=dropout,
-        )
-
-        self.feature_dim = self.mix_block.out_channels
+        self.feature_dim = mix_att_hidden_dim + mix_trans_dim + mix_fourier_dim
         self.classifier = nn.Linear(self.feature_dim, num_classes)
+        
+        # Initialize classifier
+        nn.init.xavier_uniform_(self.classifier.weight)
+        nn.init.constant_(self.classifier.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: raw eye-movement coordinates
-               shape (B, T, 2) or (B, 2, T)
+            x: raw eye-movement coordinates, shape (B, T, 2) or (B, 2, T)
 
         Returns:
             logits: (B, num_classes)
         """
+        # Clean input
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Preprocessing
         slow, fast = self.preprocess(x)  # (B, 2, T), (B, 2, T)
+        slow = torch.nan_to_num(slow, nan=0.0, posinf=0.0, neginf=0.0)
+        fast = torch.nan_to_num(fast, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Siamese CNN
         cnn_out = self.siamese_cnn(slow, fast)  # (B, C_cnn, T_cnn)
+        cnn_out = torch.nan_to_num(cnn_out, nan=0.0, posinf=0.0, neginf=0.0)
 
-        mixed = self.mix_block(cnn_out)  # (B, C_mix, T_cnn)
+        # Mix blocks
+        mixed = cnn_out
+        for mix_block in self.mix_blocks:
+            mixed = mix_block(mixed)
+            mixed = torch.nan_to_num(mixed, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Global average pooling over time
+        # Global average pooling
         feat = mixed.mean(dim=-1)  # (B, C_mix)
+        feat = torch.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Classification
         logits = self.classifier(feat)  # (B, num_classes)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
         return logits
 
 
 if __name__ == "__main__":
-    # Simple sanity check with random input
+    # Sanity check
     batch_size = 4
     seq_len = 512
     num_classes = 10
 
     model = EmMixformer(num_classes=num_classes)
-    dummy_input = torch.randn(batch_size, seq_len, 2)  # (B, T, 2)
+    dummy_input = torch.randn(batch_size, seq_len, 2)
     out = model(dummy_input)
-    print("Output shape:", out.shape)  # should be (4, 10)
-
+    print("Output shape:", out.shape)
+    print("Model created successfully!")
