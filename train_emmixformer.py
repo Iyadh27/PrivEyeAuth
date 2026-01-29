@@ -167,6 +167,12 @@ class CTBUEyeMovementDataset(Dataset):
         if seq.shape[0] > self.max_len:
             seq = seq[: self.max_len, :]
 
+        # Replace any NaN/Inf in sequence with zeros
+        seq = np.nan_to_num(seq, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Clamp extreme values to prevent numerical instability
+        seq = np.clip(seq, -1e6, 1e6)
+
         x = torch.from_numpy(seq)  # (T, 2)
         y = torch.tensor(label, dtype=torch.long)
         return x, y
@@ -213,11 +219,32 @@ def train_one_epoch(
     for batch_idx, (x, y) in enumerate(loader):
         x = x.to(device)  # (B, T, 2)
         y = y.to(device)
+        
+        # Check for NaN in input
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print(f"Warning: NaN/Inf detected in input batch {batch_idx}. Skipping batch.")
+            continue
 
         optimizer.zero_grad()
         logits = model(x)  # (B, num_classes)
+        
+        # Check for NaN in logits before computing loss
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            print(f"Warning: NaN/Inf detected in model output batch {batch_idx}. Skipping batch.")
+            continue
+        
         loss = criterion(logits, y)
+        
+        # Skip backward pass if loss is NaN/Inf
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Warning: NaN/Inf loss detected in batch {batch_idx}. Skipping backward pass.")
+            continue
+        
         loss.backward()
+        
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer.step()
 
         total_loss += loss.item() * x.size(0)
@@ -252,59 +279,113 @@ def evaluate(
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)
+            
+            # Check for NaN in input
+            if torch.isnan(x).any() or torch.isinf(x).any():
+                print(f"Warning: NaN/Inf detected in {split_name} input. Skipping batch.")
+                continue
 
             logits = model(x)
+            
+            # Check for NaN in logits
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                print(f"Warning: NaN/Inf detected in {split_name} model output. Skipping batch.")
+                continue
+            
             loss = criterion(logits, y)
+            
+            # Skip if loss is NaN/Inf
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"Warning: NaN/Inf loss detected in {split_name}. Skipping batch.")
+                continue
             
             # Get probabilities via softmax
             probs = torch.softmax(logits, dim=1)  # (B, num_classes)
+            
+            # Replace any NaN/Inf in probabilities with uniform distribution
+            if torch.isnan(probs).any() or torch.isinf(probs).any():
+                print(f"Warning: NaN/Inf in probabilities for {split_name}. Replacing with uniform.")
+                probs = torch.ones_like(probs) / probs.size(1)
 
             total_loss += loss.item() * x.size(0)
             preds = logits.argmax(dim=1)
             total_correct += (preds == y).sum().item()
             total_samples += x.size(0)
             
-            # Store probabilities and labels for EER
-            all_probs.append(probs.cpu().numpy())
-            all_labels.append(y.cpu().numpy())
+            # Store probabilities and labels for EER (only if valid)
+            probs_np = probs.cpu().numpy()
+            if not (np.isnan(probs_np).any() or np.isinf(probs_np).any()):
+                all_probs.append(probs_np)
+                all_labels.append(y.cpu().numpy())
 
     avg_loss = total_loss / total_samples
     accuracy = total_correct / total_samples
     
     # Compute EER
-    all_probs = np.concatenate(all_probs, axis=0)  # (N, num_classes)
-    all_labels = np.concatenate(all_labels, axis=0)  # (N,)
-    
-    # For each sample:
-    # - Genuine score = probability assigned to correct class
-    # - Impostor score = max probability assigned to any other class
-    genuine_scores = []
-    impostor_scores = []
-    
-    for i in range(len(all_labels)):
-        true_label = all_labels[i]
-        prob_vec = all_probs[i]
-        
-        # Genuine score: probability of correct class
-        genuine_scores.append(prob_vec[true_label])
-        
-        # Impostor score: max probability of any incorrect class
-        mask = np.arange(len(prob_vec)) != true_label
-        if mask.sum() > 0:
-            impostor_scores.append(prob_vec[mask].max())
-    
-    # Create binary labels: 0 for genuine, 1 for impostor
-    scores = np.concatenate([genuine_scores, impostor_scores]) if (genuine_scores or impostor_scores) else np.array([])
-    labels = np.concatenate(
-        [np.zeros(len(genuine_scores)), np.ones(len(impostor_scores))]
-    ) if (genuine_scores or impostor_scores) else np.array([])
-    
-    # Compute EER with safety checks
-    if scores.size == 0 or np.isnan(scores).any():
-        print(f"Warning: EER scores are empty or contain NaNs for split '{split_name}'. Setting EER=0.5.")
+    if len(all_probs) == 0:
+        print(f"Warning: No valid probabilities collected for {split_name}. Setting EER=0.5.")
         eer = 0.5
     else:
-        eer = compute_eer(labels, scores)
+        all_probs = np.concatenate(all_probs, axis=0)  # (N, num_classes)
+        all_labels = np.concatenate(all_labels, axis=0)  # (N,)
+        
+        # Filter out any rows with NaN/Inf in probabilities
+        valid_mask = ~(np.isnan(all_probs).any(axis=1) | np.isinf(all_probs).any(axis=1))
+        if valid_mask.sum() == 0:
+            print(f"Warning: No valid probability rows for {split_name}. Setting EER=0.5.")
+            eer = 0.5
+        else:
+            all_probs = all_probs[valid_mask]
+            all_labels = all_labels[valid_mask]
+            
+            # For each sample:
+            # - Genuine score = probability assigned to correct class
+            # - Impostor score = max probability assigned to any other class
+            genuine_scores = []
+            impostor_scores = []
+            
+            for i in range(len(all_labels)):
+                true_label = all_labels[i]
+                prob_vec = all_probs[i]
+                
+                # Skip if this probability vector has NaN/Inf
+                if np.isnan(prob_vec).any() or np.isinf(prob_vec).any():
+                    continue
+                
+                # Genuine score: probability of correct class
+                genuine_scores.append(float(prob_vec[true_label]))
+                
+                # Impostor score: max probability of any incorrect class
+                mask = np.arange(len(prob_vec)) != true_label
+                if mask.sum() > 0:
+                    impostor_max = float(prob_vec[mask].max())
+                    if not (np.isnan(impostor_max) or np.isinf(impostor_max)):
+                        impostor_scores.append(impostor_max)
+            
+            # Create binary labels: 0 for genuine, 1 for impostor
+            if len(genuine_scores) == 0 and len(impostor_scores) == 0:
+                print(f"Warning: No valid scores for EER computation in {split_name}. Setting EER=0.5.")
+                eer = 0.5
+            else:
+                scores = np.array(genuine_scores + impostor_scores)
+                labels = np.concatenate([
+                    np.zeros(len(genuine_scores)),
+                    np.ones(len(impostor_scores))
+                ])
+                
+                # Final safety check before calling sklearn
+                if scores.size == 0 or np.isnan(scores).any() or np.isinf(scores).any():
+                    print(f"Warning: EER scores contain NaN/Inf for split '{split_name}'. Setting EER=0.5.")
+                    eer = 0.5
+                else:
+                    try:
+                        eer = compute_eer(labels, scores)
+                        if np.isnan(eer) or np.isinf(eer):
+                            print(f"Warning: EER computation returned NaN/Inf for {split_name}. Setting EER=0.5.")
+                            eer = 0.5
+                    except Exception as e:
+                        print(f"Warning: EER computation failed for {split_name}: {e}. Setting EER=0.5.")
+                        eer = 0.5
     
     print(f"{split_name} loss={avg_loss:.4f}, acc={accuracy:.4f}, EER={eer:.4f}")
     return avg_loss, accuracy, eer
